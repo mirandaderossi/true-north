@@ -1,0 +1,407 @@
+import time
+from time import sleep
+import serial
+import paho.mqtt.client as paho
+from paho import mqtt
+
+import board
+import math
+import signal
+import adafruit_mmc56x3
+from adafruit_mmc56x3 import MMC5603
+import adafruit_lsm6ds.lsm6dsox
+
+import threading
+import busio
+import RPi.GPIO as GPIO
+
+# -------------------------- SETUP
+
+#time.sleep(30)
+
+L0 = 22
+L1 = 23
+L2 = 24
+L3 = 25
+L4 = 26
+L5 = 27
+
+ready = False
+
+i2c = board.I2C()
+mag_sensor = adafruit_mmc56x3.MMC5603(i2c)
+acc_sensor = adafruit_lsm6ds.lsm6dsox.LSM6DSOX(i2c)
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup(L0,GPIO.OUT)
+GPIO.setup(L1,GPIO.OUT)
+GPIO.setup(L2,GPIO.OUT)
+GPIO.setup(L3,GPIO.OUT)
+GPIO.setup(L4,GPIO.OUT)
+GPIO.setup(L5,GPIO.OUT)
+
+GPIO.output(L0,GPIO.HIGH)
+GPIO.output(L1,GPIO.HIGH)
+GPIO.output(L2,GPIO.HIGH)
+GPIO.output(L3,GPIO.HIGH)
+GPIO.output(L4,GPIO.HIGH)
+GPIO.output(L5,GPIO.HIGH)
+
+#i2c_cal = busio.I2C(board.SCL,board.SDA)
+#magnetometer = MMC5603(12c_cal)
+
+time.sleep(2)
+
+portwrite = '/dev/ttyUSB2'
+print('setup complete')
+
+# -------------------------- FUNCTIONS
+
+def get_calibration_data() -> tuple[float,float,float]:
+	print('Entering calibration...')
+	for i in range(5):
+		print('entering calibration')
+		GPIO.output(L1,GPIO.LOW)
+		time.sleep(1)
+		GPIO.output(L1,GPIO.HIGH)
+		time.sleep(.5)
+	
+	delay = 15
+	stop_time = time.time() + delay
+	start_time = time.time()
+	
+	count = 0
+	
+	min_x = 0
+	min_y = 0
+	min_z = 0
+	max_x = 0
+	max_y = 0
+	max_z = 0
+	
+	list_len = 5
+	
+	x_list = [0 for i in range(list_len)]
+	y_list = [0 for i in range(list_len)]
+	z_list = [0 for i in range(list_len)]
+	
+	convergence = True
+	convergence_radius = 0.1
+	
+	while True:
+		mag_x, mag_y, mag_z = mag_sensor.magnetic
+		
+		convergence = True
+		
+		min_x, min_y, min_z = min(min_x, mag_x), min(min_y, mag_y), min(min_z, mag_z)
+		max_x, max_y, max_z = max(max_x, mag_x), max(max_y, mag_y), max(max_z, mag_z)
+		
+		offset_x = (max_x + min_x) / 2
+		offset_y = (max_y + min_y) / 2
+		offset_z = (max_z + min_z) / 2
+		
+		if count%50 == 0:
+			print(time.time()-start_time)
+			print('x: ' + str(offset_x))
+			print('y: ' + str(offset_y))
+			print('z: ' + str(offset_z))
+		
+		for i in range(list_len):
+			if abs(offset_x - x_list[i]) > convergence_radius:
+				convergence = False
+				break
+			if abs(offset_y - y_list[i]) > convergence_radius:
+				convergence = False
+				break
+			if abs(offset_z - z_list[i]) > convergence_radius:
+				convergence = False
+				break
+		
+		x_list[count%list_len] = offset_x
+		y_list[count%list_len] = offset_y
+		z_list[count%list_len] = offset_z
+		
+		count+=1
+		
+		time.sleep(0.01)
+		if time.time() > stop_time and convergence:
+			break
+	
+	for i in range(5):
+		print('Calibration complete')
+		GPIO.output(L1,GPIO.LOW)
+		time.sleep(1)
+		GPIO.output(L1,GPIO.HIGH)
+		time.sleep(.5)
+	
+	return offset_x, offset_y, offset_z
+
+
+def get_gps_local():
+	ser_write.write(str.encode('AT$GPSACP\r'))
+	localgps = ser_write.readline()
+	while localgps.decode().isspace():
+		localgps = ser_write.readline()
+	print(localgps)
+	return localgps
+
+
+def gps_bytes_to_string(data):
+	print(type(data))
+	datastring = data.decode('ascii')
+	if len(data) < 30:
+		return None  #invalid GPS data: inaccurate or no fix
+	else:
+		sdata = datastring.split(',')
+#		lat, lon = coord_str_to_float(sdata[1]), coord_str_to_float(sdata[2])
+		return sdata[1]+','+sdata[2]
+
+
+def coord_str_to_float(coord_str: str) -> float:
+	x = coord_str
+	
+	deg = x[0:-8]
+   if deg[0] == '0':
+       deg = deg[1:]
+	mins = x[-8:-1]
+	dirt = x[-1]
+	
+	return coord_dms_to_float(int(deg), float(mins), dirt)
+
+
+def coord_dms_to_float(degs: int, minutes: float, dirts: str) -> float:
+	coords = degs + (minutes/60)
+	if dirts == 'S' or dirts == 'W':
+		coords *= -1
+	return coords
+
+
+def get_heading(magcal_x, magcal_y, magcal_z) -> float:
+	print('calibrated. in heading')
+	
+	mag_x, mag_y, mag_z = mag_sensor.magnetic
+	acc_x, acc_y, acc_z = acc_sensor.acceleration
+	
+	mag_used_x = -(mag_x - magcal_x)
+	mag_used_y = mag_y - magcal_y
+	mag_used_z = mag_z - magcal_z
+	
+	a = math.sqrt(acc_x*acc_x + acc_y*acc_y + acc_z*acc_z)
+	accnorm_x = acc_x/a
+	accnorm_y = acc_y/a
+	
+	pitch = math.asin(accnorm_x)
+	roll = -math.asin(accnorm_y/math.cos(pitch))
+	
+	mag_final_x = mag_used_x*math.cos(pitch) + mag_used_z*math.sin(pitch)
+	mag_final_y = mag_used_x*math.sin(roll)*math.sin(pitch) + mag_used_y*math.cos(roll) - mag_used_z*math.sin(roll)*math.cos(pitch)
+	
+	heading = (180*math.atan2(mag_final_y,mag_final_x)/math.pi)+90
+	if heading < 0:
+		heading += 360
+	return heading
+
+
+def get_led_index(local_coords: tuple[float,float], partner_coords: tuple[float,float], local_rot: float) -> int:
+	difference_vector = (
+		partner_coords[1] - local_coords[1],
+		partner_coords[0] - local_coords[0]
+	)
+	
+	difference_rot = math.atan2(
+		difference_vector[1],
+		difference_vector[0]
+	)*(180/math.pi)
+	
+	led_rot_raw = (difference_rot - local_rot + 360) % 360
+	led_rot_rounded = round_to_nearest(led_rot_raw, 60)
+	
+	led_index = int(((led_rot_rounded + 30)%360)/60)
+	print(led_index)
+	return led_index
+
+
+def round_to_nearest(inputnum, interval):
+	return round(inputnum/interval,0) * interval
+
+
+def light_led_at_index(index: int):	
+	if index == 0:
+		GPIO.output(L0,GPIO.LOW)
+		GPIO.output(L1,GPIO.HIGH)
+		GPIO.output(L2,GPIO.HIGH)
+		GPIO.output(L3,GPIO.HIGH)
+		GPIO.output(L4,GPIO.HIGH)
+		GPIO.output(L5,GPIO.HIGH)
+	elif index == 1:
+		GPIO.output(L1,GPIO.LOW)
+		GPIO.output(L0,GPIO.HIGH)
+		GPIO.output(L2,GPIO.HIGH)
+		GPIO.output(L3,GPIO.HIGH)
+		GPIO.output(L4,GPIO.HIGH)
+		GPIO.output(L5,GPIO.HIGH)
+	elif index == 2:
+		GPIO.output(L2,GPIO.LOW)
+		GPIO.output(L0,GPIO.HIGH)
+		GPIO.output(L1,GPIO.HIGH)
+		GPIO.output(L3,GPIO.HIGH)
+		GPIO.output(L4,GPIO.HIGH)
+		GPIO.output(L5,GPIO.HIGH)
+	elif index == 3:
+		GPIO.output(L3,GPIO.LOW)
+		GPIO.output(L1,GPIO.HIGH)
+		GPIO.output(L2,GPIO.HIGH)
+		GPIO.output(L0,GPIO.HIGH)
+		GPIO.output(L4,GPIO.HIGH)
+		GPIO.output(L5,GPIO.HIGH)
+	elif index == 4:
+		GPIO.output(L4,GPIO.LOW)
+		GPIO.output(L1,GPIO.HIGH)
+		GPIO.output(L2,GPIO.HIGH)
+		GPIO.output(L3,GPIO.HIGH)
+		GPIO.output(L0,GPIO.HIGH)
+		GPIO.output(L5,GPIO.HIGH)
+	elif index == 5:
+		GPIO.output(L5,GPIO.LOW)
+		GPIO.output(L1,GPIO.HIGH)
+		GPIO.output(L2,GPIO.HIGH)
+		GPIO.output(L3,GPIO.HIGH)
+		GPIO.output(L4,GPIO.HIGH)
+		GPIO.output(L0,GPIO.HIGH)
+	else:
+		GPIO.output(L0,GPIO.HIGH)
+		GPIO.output(L1,GPIO.HIGH)
+		GPIO.output(L2,GPIO.HIGH)
+		GPIO.output(L3,GPIO.HIGH)
+		GPIO.output(L4,GPIO.HIGH)
+		GPIO.output(L5,GPIO.HIGH)
+
+# ------------------------------------- SIMULATION
+
+def simulate_gps_data():
+	pass
+
+
+def simulate_led_at_index(index: int, led_states: list[bool]):
+	led_states = [False] * 6
+	led_states[index] = True
+	print(*led_states)
+
+
+
+# ------------------------------------- CONNECTIVITY
+
+def on_connect(client, userdata, flags, rc, properties=None):
+	print('CONNACK received with code %s.' % rc)
+
+
+def on_publish(client, userdata, mid, properties=None):
+	print('mid: ' + str(mid))
+
+
+def on_subscribe(client, userdata, mid, granted_qos, properties=None):
+	print('Subscribed: ' + str(mid) + ' ' + str(granted_qos))
+
+
+def on_message(client, userdata, msg):
+	global gps_partner
+	print(msg.topic + ' ' + str(msg.qos) + ' ' + str(msg.payload))
+	gps_partner = msg.payload.decode('ascii')
+	print(gps_partner)
+
+
+def do_exit():
+	print('Shutting down...')
+	client.loop_stop()
+	quit()
+
+signal.signal(signal.SIGINT, do_exit)
+signal.signal(signal.SIGTERM, do_exit)
+
+
+
+# ----------------------------------- STEPS
+
+def led_function(gpsloc, gpspart):
+	if gpsloc is None: return
+	if gpspart is None: return
+	
+	local_gps = gpsloc.split(',')
+	gps_local_tuple = coord_str_to_float(local_gps[0]),coord_str_to_float(local_gps[1])
+	
+	partner_gps = gpspart.split(',')
+	gps_partner_tuple = coord_str_to_float(partner_gps[0]),coord_str_to_float(partner_gps[1])
+	
+	heading = get_heading(cal_x, cal_y, cal_z)
+	led_index = get_led_index(gps_local_tuple, gps_partner_tuple, heading)
+	client.publish('info/pi1', payload = 'heading: '+str(heading)+' index: '+str(led_index) + ' gps_loc: '+str(gps_local_tuple) + ' gps_part: '+str(gps_partner_tuple))
+	do_display_led(led_index)
+
+
+# ----------------------------------- CONFIGURATION
+
+is_simulation = False
+do_display_led = simulate_led_at_index if is_simulation else light_led_at_index
+#do_get_gps_local = simulate_gps_data if is_simulation else get_gps_local
+
+
+# ----------------------------------- PROCEDURE
+
+cal_x, cal_y, cal_z = get_calibration_data()
+
+gps_local = None
+gps_partner = None
+sec_counter = 0
+
+client = paho.Client(client_id = 'ras2', userdata=0, protocol=paho.MQTTv5)
+client.on_connect = on_connect
+
+client.tls_set(tls_version=mqtt.client.ssl.PROTOCOL_TLS)
+client.username_pw_set('mderossi', 'Thesis23')
+
+connected = False
+
+while not connected:
+	try:
+		client.connect('fdd5168aa5524417a269fe9a326901ae.s2.eu.hivemq.cloud', 8883)
+	except:
+		print('failed')
+		time.sleep(2)
+		continue
+	connected = True
+
+
+client.on_subscribe = on_subscribe
+client.on_message = on_message
+client.on_publish = on_publish
+
+client.subscribe('gps/pi1', qos=1)
+
+print('Connecting port')
+ser_write = serial.Serial(portwrite, baudrate = 115200, timeout = 1, rtscts = True, dsrdtr = True)
+ser_write.write(str.encode('AT$GPSRST\r'))
+ser_write.write(str.encode('AT$GPSP=1\r'))
+ser_write.write(str.encode('AT$GPSP?\r'))
+status = ser_write.readline()
+while status.decode().isspace():
+	status = ser_write.readline()
+print(status)
+
+led_states = [False] * 6
+
+client.loop_start()
+
+client.publish('con', payload = 'connected', qos = 1)
+
+while True:
+	if sec_counter % 60 == 0:
+		gps_local = gps_bytes_to_string(get_gps_local())
+		client.publish('gps/pi2', payload = gps_local, qos = 1)
+#	gps_local = '4155.3352N,7266.0495W'
+#	print('in while loop')
+#	print(gps_local)
+#	print(gps_partner)
+	led_function(gps_local, gps_partner)
+	time.sleep(1)
+	sec_counter += 1
